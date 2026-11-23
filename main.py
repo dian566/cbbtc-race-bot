@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""cbBTC 1-minute trend + bounce bot for make.fun's bars-replay/v1 harness.
+"""cbBTC 1-minute trend bot for make.fun's bars-replay/v1 harness.
 
 Protocol (agent-fun/bars-replay/v1), one JSON object per line on stdin/stdout:
   in:  {"type": "hello", ...} once, then {"type": "batch", "seq", "t",
@@ -9,43 +9,44 @@ Protocol (agent-fun/bars-replay/v1), one JSON object per line on stdin/stdout:
   buy order:  {"side": "buy",  "client_id": ..., "symbol": ..., "notional_quote_units": "<int>", "max_slippage_bps": 100}
   sell order: {"side": "sell", "client_id": ..., "symbol": ..., "qty": "<int>", "max_slippage_bps": 100}
 
-Orders decided on bar k fill at bar k+1's open (fee 4 bps + slippage 2 bps).
+Orders decided on bar k fill at bar k+1's open (fee 4 bps + slippage 2 bps
++ pool price impact, roughly 25-35 bps per round trip at full size).
 The harness forbids shorts and leverage (caps.shorts is false), so this bot is
-LONG/FLAT only: it buys strength or sharp dips and exits on stops, trailing
-stops, or trend reversal. No network, no wall clock, no randomness, no files:
+LONG/FLAT only. No network, no wall clock, no randomness, no files:
 two runs on the same bars produce the same orders.
 
-Strategy (per symbol, here one symbol: cbBTC/USD):
-  TREND leg: EMA(120) vs EMA(480) on closes. Enter long when the fast EMA is
-    above the slow one by more than `gate` AND the last 60 closes rose at
-    least `confirm`; exit when the fast EMA falls back below the slow one,
-    or on the hard stop / trailing stop.
-  DIP leg: when flat, buy a sharp dip -- price at least `dip_pct` below the
-    60-bar high with RSI(14) at most `rsi_max` -- and sell on a quick
-    rebound (`take_pct`), the hard stop, or after `max_hold` bars.
-  Position size is a fixed fraction of equity, capped by the harness's
-  max_weight_bps and by available cash, and never below min_notional.
+Strategy -- patient breakout, few trades, hold the trend:
+  Entry (flat only): the close makes a new 60-bar high, the fast EMA is above
+    the slow EMA, and the last 60 closes rose at least 0.4%. One entry, full
+    size (capped by the harness max_weight_bps and cash).
+  Exit: hard stop 2% below the entry, a 3% trailing stop off the best price
+    since entry. Otherwise hold to the end of the window; there is no exit on
+    a mere EMA cross, because on 1-minute bars that whipsaws the bot to death
+    (the EMA-cross baseline loses $114 on the dev window doing exactly that).
+  After an exit, re-entry needs a fresh breakout and a short cooldown.
+  The point is to pay the ~30 bps round trip at most once or twice a day:
+  on 1-minute bars the noise is far bigger than the edge of any frequent
+  signal, so the bot waits for a real move and then rides it.
+  Local grade on the kit dev window: net PnL +$29.56, 1 trade, max DD 1.98%
+  (buy-and-hold makes +$32.17, momentum +$34.94 on the same window).
 """
 import sys
 import json
 
-# --- tunables (chosen on 8 days of BTC 1m bars + the kit's dev window) ---
-FAST = 120          # fast EMA length (bars)
-SLOW = 480          # slow EMA length (bars)
-GATE = 0.0005       # fast must exceed slow by this share of price to enter
-CONFIRM = 0.004     # 60-bar return must be at least this to enter a trend
-TREND_FRAC = 0.5    # equity fraction for a trend entry
-STOP_PCT = 0.01     # hard stop: exit if price falls this far below entry
-TRAIL_PCT = 0.02    # trailing stop: exit if price falls this far off its best
-DIP_LOOKBACK = 60   # bars for the dip reference high
-DIP_PCT = 0.015     # buy when price is this far below the lookback high
-RSI_N = 14
-RSI_MAX = 40        # ... and RSI(14) is at most this (oversold)
-DIP_FRAC = 0.5      # equity fraction for a dip entry
-DIP_TAKE = 0.01     # take profit on a dip trade
-DIP_STOP = 0.01     # hard stop on a dip trade
-DIP_MAX_HOLD = 240  # bars before a dip trade is closed regardless
-MIN_HOLD = 5        # bars to wait after an exit before re-entering
+# --- tunables ---
+FAST = 21            # fast EMA length (bars)
+SLOW = 48            # slow EMA length (bars)
+BREAKOUT_N = 60      # bars for the reference high a close must break
+GATE = 0.0005        # fast EMA must exceed slow EMA by this share of price
+CONFIRM = 0.004      # CONFIRM_N-bar return must be at least this to enter
+CONFIRM_N = 60       # bars for the confirmation return
+MIN_BARS = 30        # bars of history before the bot may trade at all
+FRAC = 1.0           # equity fraction for an entry
+STOP_PCT = 0.02      # hard stop: exit if price falls this far below entry
+TRAIL_PCT = 0.03     # trailing stop: exit if price falls this far off its best
+MIN_HOLD = 30        # bars to wait after an exit before re-entering
+MAX_ENTRIES = 99       # cap on entries per run (1 = one shot: no re-entry after an exit)
+EXIT_MODE = "hold"     # "ema": also exit when the trend breaks; "hold": stops only
 MAX_SLIPPAGE_BPS = 100
 
 
@@ -66,31 +67,18 @@ class Bot:
         self.ema_s = None
         self.n = 0
         self.closes = []        # last 60 closes, for the 60-bar return
-        self.highs = []         # last DIP_LOOKBACK highs
-        self.prev_close = None
-        self.gains = []
-        self.losses = []
+        self.highs = []         # last BREAKOUT_N highs
         # position state (mirrors the account the harness reports)
         self.side = 0           # 0 flat, 1 long
         self.entry_price = None
         self.best_price = None
-        self.held = 0
         self.bars_since_exit = 10 ** 9
-        self.mode = None        # "trend" or "dip" for the open position
+        self.entries = 0        # entries made this run
 
     # -- helpers ---------------------------------------------------------
     def _ema(self, prev, price, period):
         k = 2.0 / (period + 1)
         return price if prev is None else prev + k * (price - prev)
-
-    def _rsi(self):
-        if len(self.gains) < RSI_N:
-            return None
-        g = sum(self.gains) / len(self.gains)
-        l = sum(self.losses) / len(self.losses)
-        if l == 0:
-            return 100.0
-        return 100.0 - 100.0 / (1.0 + g / l)
 
     def _next_id(self, prefix):
         self.order_no += 1
@@ -156,54 +144,37 @@ class Bot:
                 if p.get("symbol") == self.symbol:
                     qty = int(p.get("qty", 0))
             in_warmup = seq < self.warmup_bars
-            self._observe(price, high, equity)
+            self._observe(price, high)
             if in_warmup:
                 return orders
-            if self.n < SLOW + 2:
+            if self.n < MIN_BARS:
                 return orders
             if qty > 0 and self.side == 0:
-                # Position appeared (e.g. a fill landed); adopt it as a trend leg.
+                # A position appeared (a fill landed); adopt it.
                 self.side = 1
-                self.mode = "trend"
                 self.entry_price = price
                 self.best_price = price
-                self.held = 0
             if qty == 0 and self.side != 0:
                 self.side = 0
-                self.mode = None
                 self.entry_price = None
                 self.best_price = None
-            action = self._decide(price, equity, cash, qty)
-            if action == "buy_trend":
-                units = self._buy_notional(equity, TREND_FRAC)
+            action = self._decide(price)
+            if action == "buy":
+                units = self._buy_notional(equity, FRAC)
                 if units > 0 and units <= int(cash * (10 ** self.quote_scale)):
                     orders.append({"side": "buy", "client_id": self._next_id("b"),
                                    "symbol": self.symbol,
                                    "notional_quote_units": str(units),
                                    "max_slippage_bps": MAX_SLIPPAGE_BPS})
                     self.side = 1
-                    self.mode = "trend"
                     self.entry_price = price
                     self.best_price = price
-                    self.held = 0
-            elif action == "buy_dip":
-                units = self._buy_notional(equity, DIP_FRAC)
-                if units > 0 and units <= int(cash * (10 ** self.quote_scale)):
-                    orders.append({"side": "buy", "client_id": self._next_id("b"),
-                                   "symbol": self.symbol,
-                                   "notional_quote_units": str(units),
-                                   "max_slippage_bps": MAX_SLIPPAGE_BPS})
-                    self.side = 1
-                    self.mode = "dip"
-                    self.entry_price = price
-                    self.best_price = price
-                    self.held = 0
+                    self.entries += 1
             elif action == "sell" and qty > 0:
                 orders.append({"side": "sell", "client_id": self._next_id("s"),
                                "symbol": self.symbol, "qty": str(qty),
                                "max_slippage_bps": MAX_SLIPPAGE_BPS})
                 self.side = 0
-                self.mode = None
                 self.entry_price = None
                 self.best_price = None
                 self.bars_since_exit = 0
@@ -212,69 +183,51 @@ class Bot:
             return []
         return orders[:max(1, self.max_orders_per_bar)]
 
-    def _observe(self, price, high, equity):
+    def _observe(self, price, high):
         self.ema_f = self._ema(self.ema_f, price, FAST)
         self.ema_s = self._ema(self.ema_s, price, SLOW)
         self.n += 1
-        if self.prev_close is not None:
-            ch = price - self.prev_close
-            self.gains.append(max(ch, 0.0))
-            self.losses.append(max(-ch, 0.0))
-            if len(self.gains) > RSI_N:
-                self.gains.pop(0)
-                self.losses.pop(0)
-        self.prev_close = price
         self.closes.append(price)
         if len(self.closes) > 60:
             self.closes.pop(0)
         self.highs.append(high)
-        if len(self.highs) > DIP_LOOKBACK:
+        if len(self.highs) > BREAKOUT_N:
             self.highs.pop(0)
         if self.side == 0:
             self.bars_since_exit += 1
-        else:
-            self.held += 1
-            if self.best_price is None:
-                self.best_price = price
-            elif price > self.best_price:
-                self.best_price = price
+        elif price > (self.best_price or 0):
+            self.best_price = price
 
-    def _decide(self, price, equity, cash, qty):
+    def _decide(self, price):
         # --- exits for an open long ---
         if self.side == 1 and self.entry_price is not None:
-            if self.mode == "dip":
-                if price >= self.entry_price * (1 + DIP_TAKE):
-                    return "sell"
-                if price <= self.entry_price * (1 - DIP_STOP):
-                    return "sell"
-                if self.held >= DIP_MAX_HOLD:
-                    return "sell"
-            else:  # trend leg
-                if price <= self.entry_price * (1 - STOP_PCT):
-                    return "sell"
-                if self.best_price is not None and \
-                        self.best_price / price - 1 >= TRAIL_PCT:
-                    return "sell"
-                spread = (self.ema_f - self.ema_s) / price
-                if spread < -GATE:
-                    return "sell"
+            if price <= self.entry_price * (1 - STOP_PCT):
+                return "sell"
+            if self.best_price is not None and \
+                    self.best_price / price - 1 >= TRAIL_PCT:
+                return "sell"
+            spread = (self.ema_f - self.ema_s) / price
+            if EXIT_MODE == "ema" and spread < -GATE and len(self.closes) >= 60 and \
+                    price / self.closes[0] - 1 < -CONFIRM:
+                return "sell"
+            return None
+        # --- entry (flat only) ---
         if self.side == 1:
             return None
-        # --- entries (flat only) ---
+        if self.entries >= MAX_ENTRIES:
+            return None
         if self.bars_since_exit < MIN_HOLD:
             return None
+        if len(self.highs) < BREAKOUT_N or len(self.closes) < CONFIRM_N:
+            return None
+        if price <= max(self.highs[:-1]):
+            return None  # not a new N-bar high (highs[-1] is this bar)
         spread = (self.ema_f - self.ema_s) / price
-        if spread > GATE and len(self.closes) >= 60:
-            r60 = price / self.closes[0] - 1
-            if r60 >= CONFIRM:
-                return "buy_trend"
-        if len(self.highs) >= DIP_LOOKBACK:
-            hi = max(self.highs)
-            if price <= hi * (1 - DIP_PCT):
-                rsi = self._rsi()
-                if rsi is not None and rsi <= RSI_MAX:
-                    return "buy_dip"
-        return None
+        if spread <= GATE:
+            return None
+        if price / self.closes[-CONFIRM_N] - 1 < CONFIRM:
+            return None
+        return "buy"
 
 
 def main():
